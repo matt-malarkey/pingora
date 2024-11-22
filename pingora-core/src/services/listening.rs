@@ -107,6 +107,15 @@ impl<A> Service<A> {
             .add_tls_with_settings(addr, sock_opt, settings)
     }
 
+    pub fn add_tcp_with_upgrade(
+        &mut self,
+        addr: &str,
+        sock_opt: Option<TcpSocketOptions>,
+        settings: TlsSettings,
+    ) {
+        self.listeners.add_tcp_with_upgrade_settings(addr, sock_opt, settings)
+    }
+
     /// Add an endpoint according to the given [`ServerAddress`]
     pub fn add_address(&mut self, addr: ServerAddress) {
         self.listeners.add_address(addr);
