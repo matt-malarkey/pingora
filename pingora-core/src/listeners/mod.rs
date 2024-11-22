@@ -14,7 +14,7 @@
 
 //! The listening endpoints (TCP and TLS) and their configurations.
 
-mod l4;
+pub mod l4;
 
 #[cfg(feature = "any_tls")]
 pub mod tls;
@@ -30,12 +30,16 @@ use crate::server::ListenFds;
 use async_trait::async_trait;
 use pingora_error::Result;
 use std::{fs::Permissions, sync::Arc};
+use http::Method;
+use log::info;
 
 use l4::{ListenerEndpoint, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};
 
 pub use crate::protocols::tls::ALPN;
 pub use l4::{ServerAddress, TcpSocketOptions};
+use pingora_http::ResponseHeader;
+use crate::protocols::http::v1::l4_server::L4HttpSession;
 
 /// The APIs to customize things like certificate during TLS server side handshake
 #[async_trait]
@@ -55,6 +59,7 @@ pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
 struct TransportStackBuilder {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
+    connect: bool,
 }
 
 impl TransportStackBuilder {
@@ -75,6 +80,7 @@ impl TransportStackBuilder {
         Ok(TransportStack {
             l4,
             tls: self.tls.take().map(|tls| Arc::new(tls.build())),
+            connect: self.connect,
         })
     }
 }
@@ -82,6 +88,7 @@ impl TransportStackBuilder {
 pub(crate) struct TransportStack {
     l4: ListenerEndpoint,
     tls: Option<Arc<Acceptor>>,
+    connect: bool,
 }
 
 impl TransportStack {
@@ -94,6 +101,7 @@ impl TransportStack {
         Ok(UninitializedStream {
             l4: stream,
             tls: self.tls.clone(),
+            connect: self.connect,
         })
     }
 
@@ -105,14 +113,48 @@ impl TransportStack {
 pub(crate) struct UninitializedStream {
     l4: L4Stream,
     tls: Option<Arc<Acceptor>>,
+    connect: bool,
 }
 
 impl UninitializedStream {
+    // Here the problem is that we return an encapsulated stream, and lose the ability to use the underlying L4 stream
+    // Also, l4 stream is private so...
+    // So we need to write our own version of this (and everything at this level of abstraction, basically)
     pub async fn handshake(self) -> Result<Stream> {
         if let Some(tls) = self.tls {
-            let tls_stream = tls.tls_handshake(self.l4).await?;
-            Ok(Box::new(tls_stream))
+            if self.connect {
+                let mut http_session = L4HttpSession::new(self.l4);
+
+                let res = http_session.read_request().await;
+                match res {
+                    Ok(_) => (),
+                    Err(_) => { panic!("Not a valid HTTP request: Handle this") }
+                };
+                info!("Request: {}", http_session.request_summary());
+
+                let header = http_session.req_header().as_owned_parts();
+
+                if header.method == Method::CONNECT {
+                    let resp = ResponseHeader::build(200, None).unwrap();
+                    let _ = http_session.write_response_header(Box::new(resp)).await;
+                } else {
+                    panic!("Not a CONNECT request");
+                }
+
+                // TODO Decide to upgrade to tls or not here
+
+                let st = http_session.reuse().await.unwrap();
+                info!("Re-using session, starting TLS handshake");
+
+                let tls_stream = tls.tls_handshake(st).await?;
+                Ok(Box::new(tls_stream))
+            } else {
+                info!("No CONNECT option set");
+                let tls_stream = tls.tls_handshake(self.l4).await?;
+                Ok(Box::new(tls_stream))
+            }
         } else {
+            info!("No TLS options set");
             Ok(Box::new(self.l4))
         }
     }
@@ -154,6 +196,12 @@ impl Listeners {
         Ok(listeners)
     }
 
+    pub fn tcp_with_upgrade(addr: &str, cert_path: &str, key_path: &str) -> Result<Self> {
+        let mut listeners = Self::new();
+        listeners.add_tcp_with_upgrade(addr, cert_path, key_path)?;
+        Ok(listeners)
+    }
+
     /// Add a TCP endpoint to `self`.
     pub fn add_tcp(&mut self, addr: &str) {
         self.add_address(ServerAddress::Tcp(addr.into(), None));
@@ -177,6 +225,11 @@ impl Listeners {
         Ok(())
     }
 
+    pub fn add_tcp_with_upgrade(&mut self, addr: &str, cert_path: &str, key_path: &str) -> Result<()> {
+        self.add_tcp_with_upgrade_settings(addr, None, TlsSettings::intermediate(cert_path, key_path)?);
+        Ok(())
+    }
+
     /// Add a TLS endpoint to `self` with the given socket and server side TLS settings.
     /// See [`TlsSettings`] and [`TcpSocketOptions`] for more details.
     pub fn add_tls_with_settings(
@@ -185,17 +238,26 @@ impl Listeners {
         sock_opt: Option<TcpSocketOptions>,
         settings: TlsSettings,
     ) {
-        self.add_endpoint(ServerAddress::Tcp(addr.into(), sock_opt), Some(settings));
+        self.add_endpoint(ServerAddress::Tcp(addr.into(), sock_opt), Some(settings), false);
+    }
+
+    pub fn add_tcp_with_upgrade_settings(
+        &mut self,
+        addr: &str,
+        sock_opt: Option<TcpSocketOptions>,
+        settings: TlsSettings,
+    ) {
+        self.add_endpoint(ServerAddress::Tcp(addr.into(), sock_opt), Some(settings), true);
     }
 
     /// Add the given [`ServerAddress`] to `self`.
     pub fn add_address(&mut self, addr: ServerAddress) {
-        self.add_endpoint(addr, None);
+        self.add_endpoint(addr, None, false);
     }
 
     /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided
-    pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
-        self.stacks.push(TransportStackBuilder { l4, tls })
+    pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>, connect: bool) {
+        self.stacks.push(TransportStackBuilder { l4, tls, connect })
     }
 
     pub(crate) async fn build(
